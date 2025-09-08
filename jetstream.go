@@ -256,7 +256,8 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 		}
 
 		// randomize order within the batch to reduce ordering bias
-		rand.Shuffle(len(msgs), func(i, j int) { msgs[i], msgs[j] = msgs[j], msgs[i] })
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		rng.Shuffle(len(msgs), func(i, j int) { msgs[i], msgs[j] = msgs[j], msgs[i] })
 
 		// Quieter fetch logging: only log when the batch size changes or is a full batch
 		if len(msgs) != lastFetchCount || len(msgs) == CAPACITY {

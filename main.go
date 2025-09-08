@@ -3,19 +3,15 @@ package main
 import (
 	"context"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/doradiv/fmpa/policy"
 )
 
 func main() {
 	cfg := parseFlags()
-
-	rand.Seed(time.Now().UnixNano())
 
 	p := policy.NewPolicy(CAPACITY)
 	// Explicit quotas per instructions (avoid relying on auto-add)
