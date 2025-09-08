@@ -72,56 +72,15 @@ func ensureConsumer(js nats.JetStreamContext, stream, durable string, deliverNew
 		dp = nats.DeliverNewPolicy
 	}
 	_, err := js.AddConsumer(stream, &nats.ConsumerConfig{
-		Durable:        durable,
-		AckPolicy:      nats.AckExplicitPolicy,
-		DeliverPolicy:  dp,
-		FilterSubject:  "", // receive all stream subjects
-		AckWait:        30 * time.Second,
-		MaxAckPending:  1024,
-		ReplayPolicy:   nats.ReplayInstantPolicy,
+		Durable:       durable,
+		AckPolicy:     nats.AckExplicitPolicy,
+		DeliverPolicy: dp,
+		FilterSubject: "", // receive all stream subjects
+		AckWait:       30 * time.Second,
+		MaxAckPending: 1024,
+		ReplayPolicy:  nats.ReplayInstantPolicy,
 	})
 	return err
-}
-
-func runDemo(p *policy.MessageConsumptionPolicy) {
-	fmt.Println("Running local demo (no NATS)")
-	tenants := []struct {
-		id   string
-		sets int
-	}{
-		{"tenant1", 1},
-		{"tenant2", 2},
-		{"tenant3", 1},
-		{"tenant4", 3},
-		{"tenant5", 1},
-	}
-	for _, t := range tenants {
-		p.AddTenant(t.id, t.sets)
-	}
-
-	const rounds = 10
-	for r := 0; r < rounds; r++ {
-		started := 0
-		for started < CAPACITY {
-			progress := 0
-			for _, t := range tenants {
-				if started >= CAPACITY {
-					break
-				}
-				if p.ShouldConsume(t.id, "order") {
-					p.OnMessageStart(t.id, "order")
-					_ = process(nil)
-					p.OnMessageComplete(t.id, "order")
-					started++
-					progress++
-				}
-			}
-			if progress == 0 {
-				break
-			}
-		}
-	}
-	fmt.Println("Stats:", p.GetStats())
 }
 
 func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, stream, durable string, logEach bool, deliverNew bool) error {
@@ -170,36 +129,10 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 
 	var mu sync.Mutex
 	processed := make(map[string]int)
+	var totalProcessed uint64
 
 	sem := make(chan struct{}, CAPACITY)
 	var inFlight int32
-
-	// printing + idle detection helpers
-	lastPrintedTotal := -1
-	//noMsgStreak := 0
-
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			mu.Lock()
-			// compute total processed across tenants
-			total := 0
-			for _, c := range processed {
-				total += c
-			}
-			// only print when progress occurred
-			if total != lastPrintedTotal && total > 0 {
-				fmt.Print("Processed:")
-				for tenant, count := range processed {
-					fmt.Printf(" %s=%d", tenant, count)
-				}
-				fmt.Println()
-				lastPrintedTotal = total
-			}
-			mu.Unlock()
-		}
-	}()
 
 	lastActivity := time.Now()
 	lastFetchCount := -1
@@ -228,12 +161,12 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 							log.Println("Finished processing all messages")
 							// Print a sorted per-tenant summary
 							mu.Lock()
-							if len(processed) > 0 {
-								keys := make([]string, 0, len(processed))
-								for k := range processed {
-									keys = append(keys, k)
-								}
-								sort.Strings(keys)
+							keys := make([]string, 0, len(processed))
+							for k := range processed {
+								keys = append(keys, k)
+							}
+							sort.Strings(keys)
+							if len(keys) > 0 {
 								fmt.Print("Summary:")
 								for _, k := range keys {
 									fmt.Printf(" %s=%d", k, processed[k])
@@ -241,6 +174,47 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 								fmt.Println()
 							}
 							mu.Unlock()
+
+							// Final-only totals and expected share by ProcessingSets
+							// Pull quotas from policy stats to show that premium tenants processed more.
+							stats := p.GetStats()
+							var totalSets int
+							for _, v := range stats {
+								if m, ok := v.(map[string]int); ok {
+									totalSets += m["sets"]
+								}
+							}
+							tp := atomic.LoadUint64(&totalProcessed)
+							fmt.Printf("Total processed: %d\n", tp)
+							if totalSets > 0 && len(stats) > 0 {
+								// Print per-tenant expected vs actual
+								// ExpectedPct = sets / totalSets
+								// ActualPct = processed / totalProcessed
+								type row struct {
+									id          string
+									sets        int
+									processed   int
+									expectedPct float64
+									actualPct   float64
+								}
+								var rows []row
+								for id, v := range stats {
+									m := v.(map[string]int)
+									sets := m["sets"]
+									done := processed[id]
+									exp := float64(sets) / float64(totalSets) * 100.0
+									act := 0.0
+									if tp > 0 {
+										act = float64(done) / float64(tp) * 100.0
+									}
+									rows = append(rows, row{id: id, sets: sets, processed: done, expectedPct: exp, actualPct: act})
+								}
+								sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+								fmt.Println("Share by tenant (ProcessingSets vs processed):")
+								for _, r := range rows {
+									fmt.Printf("  %s: sets=%d expected≈%.1f%% actual≈%.1f%% processed=%d\n", r.id, r.sets, r.expectedPct, r.actualPct, r.processed)
+								}
+							}
 							idle = true
 						}
 					}
@@ -313,6 +287,7 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 					mu.Lock()
 					processed[tID]++
 					mu.Unlock()
+					atomic.AddUint64(&totalProcessed, 1)
 					_ = m.Ack()
 					if logEach {
 						if md, err := m.Metadata(); err == nil {
@@ -346,21 +321,15 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 
 func main() {
 	var (
-		useNATS    bool
 		useJS      bool
 		natsURL    string
-		subject    string
-		queue      string
 		stream     string
 		durable    string
 		reset      bool
 		deliverNew bool
 	)
-	flag.BoolVar(&useNATS, "nats", false, "enable Core NATS queue subscriber mode")
 	flag.BoolVar(&useJS, "jetstream", false, "enable JetStream pull consumer mode")
 	flag.StringVar(&natsURL, "nats_url", nats.DefaultURL, "NATS server URL")
-	flag.StringVar(&subject, "subject", ">", "Core NATS subject (e.g., 'order.*', '>' for all)")
-	flag.StringVar(&queue, "queue", "workers", "Core NATS queue group name")
 	flag.StringVar(&stream, "stream", "MESSAGES", "JetStream stream name")
 	flag.StringVar(&durable, "durable", "workers", "JetStream durable consumer name")
 
@@ -382,12 +351,6 @@ func main() {
 	p.AddTenant("tenant3", 1)
 	p.AddTenant("tenant4", 3)
 	p.AddTenant("tenant5", 1)
-
-	// Demo mode
-	if !useNATS && !useJS {
-		runDemo(p)
-		return
-	}
 
 	// Graceful shutdown
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -424,40 +387,4 @@ func main() {
 		}
 		return
 	}
-
-	// Core NATS mode
-	nc, err := nats.Connect(natsURL)
-	if err != nil {
-		log.Printf("connect NATS: %v", err)
-		os.Exit(1)
-	}
-	defer nc.Drain()
-
-	sub, err := nc.QueueSubscribe(subject, queue, func(msg *nats.Msg) {
-		parts := strings.Split(msg.Subject, ".")
-		if len(parts) != 2 {
-			return
-		}
-		msgType, tenantID := parts[0], parts[1]
-
-		if !p.ShouldConsume(tenantID, msgType) {
-			return
-		}
-		p.OnMessageStart(tenantID, msgType)
-		defer p.OnMessageComplete(tenantID, msgType)
-
-		if err := process(msg.Data); err != nil {
-			log.Printf("handler error for %s: %v", msg.Subject, err)
-			return
-		}
-	})
-	if err != nil {
-		log.Printf("subscribe: %v", err)
-		os.Exit(1)
-	}
-	defer sub.Unsubscribe()
-	_ = sub.SetPendingLimits(-1, -1)
-
-	log.Printf("Core NATS ready. subject=%q queue=%q", subject, queue)
-	<-ctx.Done()
 }
