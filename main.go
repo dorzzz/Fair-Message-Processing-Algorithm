@@ -10,6 +10,11 @@ import (
 	"github.com/doradiv/fmpa/policy"
 )
 
+
+/*
+	Read the instruction.txt before running this nats example 
+*/
+
 func main() {
 	cfg := parseFlags()
 

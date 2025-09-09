@@ -1,44 +1,5 @@
-Easy instruction for Workers and Consumers : 
- 
+There are two main purposes for this README file:
 
- Init start : 
+1. To describe the policy implemented for the FMPA and the required tests.
 
- | start NATS server | 
-----------------------------
- nats-server -js -m 8222
-
-
-
-Workers : 
-
-| start working | 
-----------------------------
- go run . -jetstream -nats_url nats://127.0.0.1:4222 -stream MESSAGES -durable workers
-
-
-
-******************************************************************************************
-
-Consumers :
-
-| Fair Load |
-----------------------------
-for i in $(seq 1 400); do
-t=$(( (RANDOM % 5) + 1 ))
-    nats -s nats://127.0.0.1:4222 pub "order.tenant$t" '{}'
-done
-
-| Burst fairness check | 
-----------------------------
-for i in $(seq 1 40); do nats -s nats://127.0.0.1:4222 pub 'order.tenant4' '{}'; done
-for i in $(seq 1 10);  do nats -s nats://127.0.0.1:4222 pub 'order.tenant1' '{}'; done
-
-| Verify messages amount | 
-----------------------------
-nats -s nats://127.0.0.1:4222 stream info MESSAGES | grep -E '^ *Messages:'
-
-
-| delete all messages ( clean buffer ) while worker is stopped | 
-----------------------------
-nats -s nats://127.0.0.1:4222 stream purge MESSAGES
-nats -s nats://127.0.0.1:4222 consumer rm MESSAGES workers
+2. To demonstrate the use of NATS for sending and receiving messages concurrently for each tenant. An `instruction.txt` file has been added for this purpose.
