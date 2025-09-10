@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const TEST_CAPACITY int = 1000
+const TEST_CAPACITY int = 10000
 
 func TestFairness(t *testing.T) {
 	p := NewPolicy(TEST_CAPACITY)

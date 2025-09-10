@@ -47,3 +47,23 @@ nats -s nats://127.0.0.1:4222 stream info MESSAGES | grep -E '^ *Messages:'
 ----------------------------
 nats -s nats://127.0.0.1:4222 stream purge MESSAGES
 nats -s nats://127.0.0.1:4222 consumer rm MESSAGES workers
+
+
+******************************************************************************************
+
+
+How to reset :
+# stop worker
+nats -s nats://127.0.0.1:4222 consumer rm MESSAGES workers
+nats -s nats://127.0.0.1:4222 stream purge MESSAGES
+
+# recreate consumer to read ALL history
+nats -s nats://127.0.0.1:4222 consumer add MESSAGES workers \
+  --pull --deliver all --ack explicit --wait=30s --filter 'order.*' --defaults
+
+# 1. publish 400
+for i in $(seq 1 400); do t=$(( (RANDOM % 5) + 1 )); nats -s nats://127.0.0.1:4222 pub "order.tenant$t" '{}'; done
+nats -s nats://127.0.0.1:4222 stream info MESSAGES | grep -E '^ *Messages:'
+
+# 2. run worker with verbose acks once
+go run . -jetstream -nats_url nats://127.0.0.1:4222 -stream MESSAGES -durable workers -logEach

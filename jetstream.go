@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,8 +80,23 @@ func ensureConsumer(js nats.JetStreamContext, stream, durable string, deliverNew
 	return err
 }
 
+// publishSynthetic publishes N messages across tenants 1..5 on subjects order.tenant{N}.
+func publishSynthetic(js nats.JetStreamContext, total int) error {
+	for i := 0; i < total; i++ {
+		t := (i % 5) + 1
+		subj := "order.tenant" + strconv.Itoa(t)
+		if _, err := js.Publish(subj, []byte("{}")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // printFinalSummary prints sorted per-tenant counts and expected vs actual shares.
-func printFinalSummary(p *policy.MessageConsumptionPolicy, processed map[string]int, totalProcessed uint64) {
+func printFinalSummary(p *policy.MessageConsumptionPolicy, processed map[string]int, totalProcessed uint64, producedThisRun uint64, deliveredThisRun uint64) {
+	fmt.Printf("Produced this run: %d\n", producedThisRun)
+	fmt.Printf("Delivered to this consumer this run: %d\n", deliveredThisRun)
+
 	// Sorted per-tenant summary
 	keys := make([]string, 0, len(processed))
 	for k := range processed {
@@ -183,21 +199,32 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 		return fmt.Errorf("ensure consumer: %w", err)
 	}
 
-	// Bind to the durable pull consumer created above; no subject needed when binding.
-	sub, err := js.PullSubscribe("", durable, nats.Bind(stream, durable), nats.ManualAck())
+	// Bind to the durable pull consumer. Use the exact filter subject if the durable has one.
+	var bindSubject string
+	if ciProbe, err := js.ConsumerInfo(stream, durable); err == nil && ciProbe != nil {
+		bindSubject = ciProbe.Config.FilterSubject
+	}
+	subjectForBind := bindSubject // empty means "use durable's filter"
+	sub, err := js.PullSubscribe(subjectForBind, durable, nats.Bind(stream, durable), nats.ManualAck())
 	if err != nil {
-		// if binding failed due to not found, surface clearer error
-		return fmt.Errorf("pull subscribe bind failed: %w", err)
+		return fmt.Errorf("pull subscribe bind failed: %w (filter=%q)", err, subjectForBind)
 	}
 	if ci, err := js.ConsumerInfo(stream, durable); err == nil {
-		log.Printf("consumer bound: pending=%d ack_pending=%d waiting=%d delivered(c=%d s=%d)",
-			ci.NumPending, ci.NumAckPending, ci.NumWaiting, ci.Delivered.Consumer, ci.Delivered.Stream)
-		if ci.Config.FilterSubject != "" {
-			return fmt.Errorf("consumer %q has unexpected filter %q; delete it or use --reset", durable, ci.Config.FilterSubject)
-		}
+		log.Printf("consumer bound: pending=%d ack_pending=%d waiting=%d delivered(c=%d s=%d) filter=%q",
+			ci.NumPending, ci.NumAckPending, ci.NumWaiting, ci.Delivered.Consumer, ci.Delivered.Stream, ci.Config.FilterSubject)
 		if deliverNew && ci.Config.DeliverPolicy != nats.DeliverNewPolicy {
 			return fmt.Errorf("consumer %q not set to DeliverNew; use --reset to recreate with --deliver_new", durable)
 		}
+	}
+
+	// Declare baseline variables for use in select loop and later
+	var deliveredStart uint64
+	var msgsStart uint64
+	if ci, err := js.ConsumerInfo(stream, durable); err == nil && ci != nil {
+		deliveredStart = ci.Delivered.Consumer
+	}
+	if si0, err := js.StreamInfo(stream); err == nil && si0 != nil {
+		msgsStart = si0.State.Msgs
 	}
 
 	var mu sync.Mutex
@@ -216,11 +243,27 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 		select {
 		case <-ctx.Done():
 			log.Println("shutdown requested")
+			// Final summary on exit path
+			mu.Lock()
+			snap := make(map[string]int, len(processed))
+			for k, v := range processed {
+				snap[k] = v
+			}
+			mu.Unlock()
+
+			var producedNow, deliveredNow uint64
+			if siNow, err := js.StreamInfo(stream); err == nil && siNow != nil {
+				producedNow = siNow.State.Msgs - msgsStart
+			}
+			if ciNow, err := js.ConsumerInfo(stream, durable); err == nil && ciNow != nil {
+				deliveredNow = ciNow.Delivered.Consumer - deliveredStart
+			}
+			printFinalSummary(p, snap, atomic.LoadUint64(&totalProcessed), producedNow, deliveredNow)
 			return nil
 		default:
 		}
 
-		msgs, err := sub.Fetch(CAPACITY, nats.MaxWait(500*time.Millisecond))
+		msgs, err := sub.Fetch(CAPACITY, nats.MaxWait(5*time.Second))
 		if err != nil && err != nats.ErrTimeout {
 			log.Printf("fetch error: %v", err)
 			continue
@@ -229,9 +272,12 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 			// No new messages fetched; if also no in-flight work and the consumer has no backlog, declare finished.
 			if atomic.LoadInt32(&inFlight) == 0 && time.Since(lastActivity) > 2*time.Second {
 				if ci, err := js.ConsumerInfo(stream, durable); err == nil {
-					if ci.NumPending == 0 && ci.NumAckPending == 0 {
+					log.Printf("idle poll: pending=%d ack_pending=%d waiting=%d delivered(c=%d s=%d)",
+						ci.NumPending, ci.NumAckPending, ci.NumWaiting, ci.Delivered.Consumer, ci.Delivered.Stream)
+					if ci.NumPending == 0 && ci.NumAckPending == 0 && atomic.LoadInt32(&inFlight) == 0 {
 						if !idle {
 							log.Println("Finished processing all messages")
+							log.Printf("consumer totals: delivered=%d pending=%d ack_pending=%d waiting=%d", ci.Delivered.Consumer, ci.NumPending, ci.NumAckPending, ci.NumWaiting)
 							// Snapshot processed counts under lock, then print outside.
 							mu.Lock()
 							snap := make(map[string]int, len(processed))
@@ -239,7 +285,15 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 								snap[k] = v
 							}
 							mu.Unlock()
-							printFinalSummary(p, snap, atomic.LoadUint64(&totalProcessed))
+
+							var producedNow, deliveredNow uint64
+							if siNow, err := js.StreamInfo(stream); err == nil && siNow != nil {
+								producedNow = siNow.State.Msgs - msgsStart
+							}
+							if ciNow, err := js.ConsumerInfo(stream, durable); err == nil && ciNow != nil {
+								deliveredNow = ciNow.Delivered.Consumer - deliveredStart
+							}
+							printFinalSummary(p, snap, atomic.LoadUint64(&totalProcessed), producedNow, deliveredNow)
 							idle = true
 						}
 					}
@@ -287,7 +341,8 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 
 				// Check policy; if not allowed right now, defer within this batch.
 				if !p.ShouldConsume(tenantID, msgType) {
-					_ = msg.Nak()
+					// Defer locally within this batch to give other tenants/messages a chance this pass.
+					deferred = append(deferred, msg)
 					continue
 				}
 
@@ -310,11 +365,16 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 						return
 					}
 
+					if err := m.AckSync(); err != nil {
+						log.Printf("ack failed for %s: %v", m.Subject, err)
+						// Do not count as processed on ack failure
+						return
+					}
+
 					mu.Lock()
 					processed[tID]++
 					mu.Unlock()
 					atomic.AddUint64(&totalProcessed, 1)
-					_ = m.Ack()
 					if logEach {
 						if md, err := m.Metadata(); err == nil {
 							log.Printf("ACK subject=%s tenant=%s sseq=%d cseq=%d", m.Subject, tID, md.Sequence.Stream, md.Sequence.Consumer)
@@ -338,9 +398,27 @@ func runJetStream(ctx context.Context, p *policy.MessageConsumptionPolicy, url, 
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
-		// Any messages still remaining after retries: NAK with a small delay so they reappear later.
+		// NAK any still-deferred messages after all local retries so they can reappear later via redelivery.
 		for _, msg := range remaining {
 			_ = msg.Nak() // immediate requeue keeps them in pending so we don't declare finished early
 		}
 	}
+	// Final summary on exit path
+	mu.Lock()
+	snap := make(map[string]int, len(processed))
+	for k, v := range processed {
+		snap[k] = v
+	}
+	mu.Unlock()
+
+	var producedNow, deliveredNow uint64
+	if siNow, err := js.StreamInfo(stream); err == nil && siNow != nil {
+		producedNow = siNow.State.Msgs - msgsStart
+	}
+	if ciNow, err := js.ConsumerInfo(stream, durable); err == nil && ciNow != nil {
+		deliveredNow = ciNow.Delivered.Consumer - deliveredStart
+	}
+	printFinalSummary(p, snap, atomic.LoadUint64(&totalProcessed), producedNow, deliveredNow)
+
+	return nil
 }
